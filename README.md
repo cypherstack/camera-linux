@@ -89,13 +89,17 @@ cd example && flutter run -d linux
 The test suite covers the pixel-format conversions, the encoder and the
 MJPEG repair without hardware. One test streams from a real camera and is
 skipped when none is attached. To exercise it without a webcam load
-`v4l2loopback` and feed it frames, for example:
+`v4l2loopback` and feed it frames with `tool/v4l2loopback_feed.py` (needs
+numpy and Pillow; `qrcode` for a real QR code):
 
 ```sh
 sudo modprobe v4l2loopback video_nr=42 card_label=test exclusive_caps=1
-ffmpeg -re -loop 1 -i qr.png -vf format=yuyv422 -f v4l2 /dev/video42
+python3 tool/v4l2loopback_feed.py /dev/video42 --format yuyv --text 'hello' &
 CAMERA_LINUX_DEVICE=/dev/video42 dart test
 ```
+
+`--format mjpeg --strip-dht` reproduces cameras whose MJPEG frames lack
+Huffman tables.
 
 ## License
 

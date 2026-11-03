@@ -5,7 +5,8 @@
 // frame as a JPEG, either passed through (MJPEG cameras) or encoded here from
 // the raw pixels. Nothing outside libc and the kernel UAPI headers is used.
 
-#define _GNU_SOURCE
+// scandir(), strdup() and the POSIX thread API.
+#define _DEFAULT_SOURCE
 
 #include "camera_linux.h"
 
@@ -507,9 +508,18 @@ static int video_node_filter(const struct dirent *entry) {
   return 1;
 }
 
+// Node number of "videoN"; the filter above guarantees digits only.
+static long video_node_number(const struct dirent *entry) {
+  long n = 0;
+  for (const char *p = entry->d_name + 5; *p && n < 1000000; p++) {
+    n = n * 10 + (*p - '0');
+  }
+  return n;
+}
+
 static int video_node_compare(const struct dirent **a, const struct dirent **b) {
-  long na = strtol((*a)->d_name + 5, NULL, 10);
-  long nb = strtol((*b)->d_name + 5, NULL, 10);
+  long na = video_node_number(*a);
+  long nb = video_node_number(*b);
   return na < nb ? -1 : (na > nb ? 1 : 0);
 }
 
