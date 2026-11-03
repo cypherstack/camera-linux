@@ -1,132 +1,103 @@
 # camera_linux
 
-Camera Linux is a Flutter FFI plugin designed specifically for the Linux platform. This plugin allows Flutter developers to access and capture images from the Linux camera, seamlessly integrating native code invocation using Dart's FFI.
+Captures JPEG frames from a webcam on Linux through `dart:ffi`, for Flutter
+and plain Dart programs.
 
-## Features
+The native part is a single C file that talks to the kernel's V4L2 API
+directly and is compiled by a [build hook](https://dart.dev/tools/hooks)
+(`hook/build.dart`) when the app is built. There is nothing to install and
+nothing to bundle by hand: no OpenCV, no CMake plugin, no system packages
+beyond a C compiler and the kernel headers that every distribution ships with
+its toolchain. The resulting `libcamera_linux.so` depends on libc only.
 
-- Dart FFI Integration: Built on top of Flutter's FFI (Foreign Function Interface) to directly invoke native functions.
-- Platform-Specific: Tailored for Linux, ensuring optimal performance and compatibility.
-- Easy Access to Camera: Provides straightforward functions to initialize, capture images, and stop the camera.
-- Base64 Image Encoding: Captures images and converts them to base64 format for easy display and manipulation.
+## Requirements
 
-## Getting Started
+- Dart 3.10 or Flutter 3.38 or newer (build hooks are enabled by default
+  there). The package is a plain Dart package, so it also works outside
+  Flutter, for example under `dart test` and `dart run`.
+- A C compiler on the build machine. The hook uses the one the SDK finds
+  (`clang` or `gcc`).
+- A Flutter app's `linux/CMakeLists.txt` must contain the "native assets"
+  install block that `flutter create` has generated since Flutter 3.24:
 
-To use this plugin, add `camera_linux` as a dependency in your `pubspec.yaml` file:
+  ```cmake
+  set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/linux/")
+  install(DIRECTORY "${NATIVE_ASSETS_DIR}"
+     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+     COMPONENT Runtime)
+  ```
 
-```yaml
-dependencies:
-  camera_linux: ^0.1.0
-```
+  Older runners miss it and the library would not be copied into
+  `bundle/lib`.
 
-## System Dependencies
-
-Before using this plugin, ensure you have the necessary system dependencies installed. The main requirement is the OpenCV library. Here's how to install it on various Linux distributions:
-
-### Ubuntu and Debian-based systems:
-```bash
-sudo apt update
-sudo apt install libopencv-dev
-```
-
-### Fedora:
-```bash
-sudo dnf install opencv opencv-devel
-```
-
-### Arch Linux and Manjaro:
-```bash
-sudo pacman -S opencv
-```
-
-### openSUSE:
-```bash
-sudo zypper install opencv opencv-devel
-```
-
-### CentOS/RHEL:
-First, enable the EPEL repository:
-```bash
-sudo yum install epel-release
-```
-Then install OpenCV:
-```bash
-sudo yum install opencv opencv-devel
-```
-
-### Gentoo:
-```bash
-sudo emerge --ask media-libs/opencv
-```
-
-For other Linux distributions, please refer to their package management systems to install the equivalent OpenCV development libraries. The package might be named `opencv`, `libopencv`, or `opencv-devel` depending on the distribution.
-
-If your distribution doesn't provide pre-built OpenCV packages, you may need to compile OpenCV from source. Refer to the [official OpenCV documentation](https://docs.opencv.org/master/d7/d9f/tutorial_linux_install.html) for detailed instructions.
+At run time the user needs read and write access to the `/dev/video*` node,
+which desktop distributions grant through the `video` group or logind.
+Inside a Flatpak that means `--device=all` (or an explicit `--device=input`
+plus the camera portal).
 
 ## Usage
-
-Here's a basic example of how to use the `camera_linux` plugin:
 
 ```dart
 import 'package:camera_linux/camera_linux.dart';
 
-// Create an instance of the plugin
-final cameraLinux = CameraLinux();
+final camera = CameraLinux();
 
-// Initialize the camera
-await cameraLinux.initializeCamera();
+// Which devices would be tried, in order.
+print(CameraLinux.availableDevices());
 
-// Capture an image
-String base64Image = await cameraLinux.captureImage();
+// Opens the first usable device (or the one named in CAMERA_LINUX_DEVICE)
+// and starts a capture thread. Throws CameraLinuxException on failure.
+await camera.initializeCamera();
 
-// Stop the camera
-cameraLinux.stopCamera();
+// Each frame is handed out once; null means nothing new has arrived yet.
+final Uint8List? jpeg = camera.captureJpeg();
+
+// Compatibility API: the same frame, base64url encoded ('' when none).
+final String base64 = await camera.captureImage();
+
+camera.stopCamera();
 ```
 
-## API Reference
+`initializeCamera` accepts a `devicePath`, a requested `width` and `height`
+(the driver may pick another size, see `frameSize`) and a `jpegQuality`.
 
-### `CameraLinux` Class
+## How frames are produced
 
-#### `initializeCamera()`
-Initializes the camera and starts video capture in a separate thread.
+The capture thread streams with memory-mapped buffers and keeps only the
+newest frame. On `captureJpeg()`:
 
-#### `captureImage()`
-Captures the latest frame from the camera and returns it as a base64-encoded string.
+- MJPEG/JPEG cameras: the frame is passed through. UVC cameras often omit the
+  Huffman tables from their MJPEG frames, which makes Skia and `package:image`
+  reject them, so the standard tables are inserted when missing.
+- YUYV, UYVY, YVYU, VYUY, NV12, NV21, YU12, YV12, RGB24, BGR24 and GREY
+  frames are converted and encoded with the public-domain
+  [stb_image_write](https://github.com/nothings/stb) encoder vendored in
+  `src/`.
 
-#### `stopCamera()`
-Stops the video capture and closes the camera.
+Uncompressed formats are preferred when a camera offers both, so that the
+JPEG the app sees is the same for every camera. Device nodes that are not
+streaming video capture devices (UVC metadata nodes, for example) are
+skipped.
 
-## Example
+## Development
 
-The plugin includes an example app demonstrating its usage. The app provides buttons to start the camera, capture images, and stop the camera. Captured images are displayed in the app.
-
-To run the example app:
-
-1. Navigate to the example directory: `cd example`
-2. Run the app: `flutter run -d linux`
-
-## Project Structure
-
-- `src/`: Contains the native source code and CMakeLists.txt for building the dynamic library.
-- `lib/`: Contains the Dart code defining the plugin API and FFI bindings.
-- `linux/`: Contains build files for bundling the native code library with the platform application.
-
-## Building and Bundling Native Code
-
-The `pubspec.yaml` specifies this as an FFI plugin:
-
-```yaml
-plugin:
-  platforms:
-    linux:
-      ffiPlugin: true
+```sh
+dart test            # builds the hook, runs the unit tests
+cd example && flutter run -d linux
 ```
 
-This configuration invokes the native build for Linux and bundles the binaries in Flutter applications using this FFI plugin.
+The test suite covers the pixel-format conversions, the encoder and the
+MJPEG repair without hardware. One test streams from a real camera and is
+skipped when none is attached. To exercise it without a webcam load
+`v4l2loopback` and feed it frames, for example:
 
-## Binding to Native Code
-
-The Dart bindings to native code are auto-generated from the header file (`src/camera_linux.h`) using the `package:ffigen`. To refresh these bindings, run:
-
+```sh
+sudo modprobe v4l2loopback video_nr=42 card_label=test exclusive_caps=1
+ffmpeg -re -loop 1 -i qr.png -vf format=yuyv422 -f v4l2 /dev/video42
+CAMERA_LINUX_DEVICE=/dev/video42 dart test
 ```
-flutter pub run ffigen --config ffigen.yaml
-```
+
+## License
+
+BSD 3-Clause (see `LICENSE`). `src/stb_image_write.h` is public domain
+(or MIT, at your option) by Sean Barrett and contributors.
