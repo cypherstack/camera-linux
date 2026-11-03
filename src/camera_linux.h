@@ -47,8 +47,9 @@ CAMERA_LINUX_EXPORT int camera_linux_status(void);
 // Returns the newest frame as a JPEG in a malloc()ed buffer and stores its
 // size in `*length`. Each frame is handed out once: the next call returns
 // NULL with `*length` 0 until the camera delivers another frame. Also returns
-// NULL when nothing is running or a frame could not be converted (then
-// camera_linux_last_error() is set). Free the buffer with camera_linux_free().
+// NULL when nothing is running or a frame could not be converted; in the
+// latter case camera_linux_last_error() returns the reason. Free the buffer
+// with camera_linux_free().
 CAMERA_LINUX_EXPORT uint8_t *camera_linux_read_jpeg(int32_t *length);
 
 // Stores the negotiated frame size. Returns 0, or -1 when nothing is running.
@@ -64,8 +65,11 @@ CAMERA_LINUX_EXPORT char *camera_linux_device(void);
 // is none); free it with camera_linux_free().
 CAMERA_LINUX_EXPORT char *camera_linux_list_devices(void);
 
-// Copy of the last error message (malloc()ed, free with camera_linux_free()),
-// or NULL when no error has been recorded since the last camera_linux_start().
+// Takes the pending error message: a malloc()ed copy (free it with
+// camera_linux_free()), or NULL when nothing failed since the previous call
+// or the last camera_linux_start(). Errors come from camera_linux_start(),
+// the capture thread (see camera_linux_status()) and frame conversion in
+// camera_linux_read_jpeg().
 CAMERA_LINUX_EXPORT char *camera_linux_last_error(void);
 
 // Frees memory returned by this library.

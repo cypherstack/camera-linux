@@ -230,6 +230,18 @@ void main() {
       expect(_toRgb([7, 200], 'GREY', 2, 1), [7, 7, 7, 200, 200, 200]);
     });
 
+    test('NV12 with an odd width needs only 2 * ceil(w / 2) chroma bytes', () {
+      // 3x1: 3 luma bytes, then one chroma row of 4 bytes.
+      expect(_toRgb([81, 81, 81, 90, 240, 0, 0], 'NV12', 3, 1), isNotNull);
+      expect(_toRgb([81, 81, 81, 90, 240, 0], 'NV12', 3, 1), isNull);
+    });
+
+    test('rejects absurd dimensions', () {
+      expect(_toRgb(List.filled(16, 0), 'YUYV', 0x40000000, 1), isNull);
+      expect(_toRgb(List.filled(16, 0), 'GREY', 1, 0x7fffffff), isNull);
+      expect(_encode(Uint8List(16), 0x40000000, 1, 1), isNull);
+    });
+
     test('rejects short buffers and unknown formats', () {
       expect(_toRgb([yRed, uRed, yRed], 'YUYV', 2, 1), isNull);
       expect(_toRgb([0, 0, 0, 0], 'YUYV', 2, 2), isNull);

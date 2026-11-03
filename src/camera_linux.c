@@ -37,6 +37,9 @@
 #define BUFFER_COUNT 4
 #define MAX_VIDEO_NODES 64
 #define POLL_TIMEOUT_MS 500
+// Largest frame edge accepted anywhere; keeps every size computation below
+// well inside int32_t.
+#define MAX_DIMENSION 16384
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -71,7 +74,10 @@ static void clear_error(void) {
 char *camera_linux_last_error(void) {
   char *copy = NULL;
   pthread_mutex_lock(&error_lock);
-  if (error_set) copy = strdup(error_text);
+  if (error_set) {
+    copy = strdup(error_text);
+    error_set = false;
+  }
   pthread_mutex_unlock(&error_lock);
   return copy;
 }
@@ -159,6 +165,7 @@ int camera_linux_frame_to_rgb(const uint8_t *src, int32_t src_len,
                               uint32_t fourcc, int32_t w, int32_t h,
                               int32_t stride, uint8_t *dst) {
   if (!src || !dst || w <= 0 || h <= 0 || src_len < 0) return -1;
+  if (w > MAX_DIMENSION || h > MAX_DIMENSION) return -1;
   int64_t need;
   switch (fourcc) {
     case V4L2_PIX_FMT_YUYV:
@@ -189,7 +196,9 @@ int camera_linux_frame_to_rgb(const uint8_t *src, int32_t src_len,
     case V4L2_PIX_FMT_NV21: {
       if (stride < w) stride = w;
       int32_t ch = (h + 1) / 2;
-      need = (int64_t)stride * h + (int64_t)stride * ch;
+      // Chroma rows hold 2 * ceil(w / 2) bytes; the last one may be shorter
+      // than the stride.
+      need = (int64_t)stride * h + (int64_t)stride * (ch - 1) + ((w + 1) / 2) * 2;
       if (need > src_len) return -1;
       const uint8_t *uv = src + (size_t)stride * h;
       bool nv21 = fourcc == V4L2_PIX_FMT_NV21;
@@ -305,6 +314,7 @@ uint8_t *camera_linux_encode_jpeg(const uint8_t *pixels, int32_t w, int32_t h,
   if (!pixels || !length || w <= 0 || h <= 0 || (comp != 1 && comp != 3)) {
     return NULL;
   }
+  if (w > MAX_DIMENSION || h > MAX_DIMENSION) return NULL;
   if (quality <= 0 || quality > 100) quality = DEFAULT_JPEG_QUALITY;
   byte_buffer out = {0};
   int ok = stbi_write_jpg_to_func(stb_write_callback, &out, w, h, comp, pixels,
@@ -754,8 +764,8 @@ static int setup_streaming(int32_t width, int32_t height) {
   session.width = fmt.fmt.pix.width;
   session.height = fmt.fmt.pix.height;
   session.bytes_per_line = fmt.fmt.pix.bytesperline;
-  if (session.width == 0 || session.height == 0 || session.width > 16384 ||
-      session.height > 16384) {
+  if (session.width == 0 || session.height == 0 ||
+      session.width > MAX_DIMENSION || session.height > MAX_DIMENSION) {
     set_error("driver reported frame size %ux%u", session.width,
               session.height);
     return -1;
@@ -918,7 +928,8 @@ uint8_t *camera_linux_read_jpeg(int32_t *length) {
   if (is_jpeg_format(fourcc)) {
     jpeg = camera_linux_fix_mjpeg(raw, (int32_t)raw_len, length);
     if (!jpeg) set_error("camera delivered a frame that is not a JPEG");
-  } else if (fourcc == V4L2_PIX_FMT_GREY && stride == w) {
+  } else if (fourcc == V4L2_PIX_FMT_GREY && stride == w &&
+             raw_len >= (size_t)w * (size_t)h) {
     jpeg = camera_linux_encode_jpeg(raw, w, h, 1, quality, length);
     if (!jpeg) set_error("JPEG encoding failed");
   } else {

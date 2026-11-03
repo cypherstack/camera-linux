@@ -129,16 +129,21 @@ class CameraLinux {
   /// Returns the newest frame as JPEG bytes, or null when no frame has
   /// arrived since the previous call.
   ///
-  /// Throws a [CameraLinuxException] when the capture has stopped because of
-  /// an error, such as the camera being unplugged.
+  /// Throws a [CameraLinuxException] when a frame could not be converted or
+  /// the capture has stopped because of an error, such as the camera being
+  /// unplugged.
   Uint8List? captureJpeg() {
     _checkPlatform();
     final length = calloc<Int32>();
     try {
       final ptr = bindings.cameraLinuxReadJpeg(length);
       if (ptr == nullptr) {
+        // A frame that could not be converted, or a capture thread that
+        // died, leaves an error behind; no frame yet leaves none.
+        final error = _lastError();
+        if (error != null) throw CameraLinuxException(error);
         if (bindings.cameraLinuxStatus() == bindings.cameraLinuxFailed) {
-          throw CameraLinuxException(_lastError() ?? 'capture stopped');
+          throw CameraLinuxException('capture stopped');
         }
         return null;
       }
