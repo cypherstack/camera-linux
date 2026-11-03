@@ -447,7 +447,7 @@ uint8_t *camera_linux_fix_mjpeg(const uint8_t *src, int32_t src_len,
 
 typedef struct {
   char path[256];
-  char card[32];
+  char card[33];  // v4l2_capability.card is 32 bytes, not always NUL-terminated
   uint32_t fourcc;
 } device_info;
 
