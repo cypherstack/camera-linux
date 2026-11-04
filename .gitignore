@@ -44,3 +44,6 @@ app.*.map.json
 
 # Example app build output
 example/build/
+
+# Not committed for a package, as in flutter/packages.
+pubspec.lock

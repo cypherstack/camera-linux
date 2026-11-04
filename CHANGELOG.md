@@ -1,19 +1,22 @@
 ## 0.1.0
 
-* Rewritten on top of V4L2 with a Dart build hook (`hook/build.dart`); the
-  package is now a plain Dart package rather than a CMake FFI plugin.
-* OpenCV is no longer needed, at build time or at run time. The shared object
-  depends on libc only and is bundled automatically by Flutter.
-* MJPEG cameras are passed through (with missing Huffman tables repaired);
-  YUYV, UYVY, YVYU, VYUY, NV12, NV21, YU12, YV12, RGB24, BGR24 and GREY are
-  converted and encoded here.
-* New API: `CameraLinux.availableDevices()`, `captureJpeg()`, `isRunning`,
-  `frameSize`, `devicePath`, `initializeCamera(devicePath:, width:, height:,
-  jpegQuality:)`; failures throw `CameraLinuxException` instead of printing.
-* `captureImage()` keeps returning a base64url JPEG and now returns an empty
-  string, rather than throwing, when no new frame is available.
-* Frames returned to Dart are allocated with `malloc`, matching how they are
-  freed.
+* Rewrites the package as a Linux implementation of the `camera` federated
+  plugin: `CameraLinux` implements `CameraPlatform` and registers itself as
+  the `dartPluginClass`.
+* Replaces the OpenCV-based CMake plugin with a V4L2 capture library that a
+  Dart build hook compiles at build time. No native dependencies remain; the
+  shared object depends on libc only.
+* Supports `availableCameras`, camera creation with resolution presets,
+  initialization, `takePicture`, image streaming as JPEG frames, a
+  frame-based preview with pause and resume, error and closing events, and
+  disposal. Video recording and the flash, zoom, focus and exposure controls
+  throw `UnsupportedError`.
+* Passes MJPEG frames through, inserting the standard Huffman tables when a
+  camera omits them, and converts YUYV, UYVY, YVYU, VYUY, NV12, NV21, YU12,
+  YV12, RGB24, BGR24 and GREY frames.
+* The earlier `CameraLinux().initializeCamera()` / `captureImage()` /
+  `stopCamera()` API is gone; use the `camera` package APIs, or
+  `CameraPlatform.instance` directly.
 
 ## 0.0.8
 

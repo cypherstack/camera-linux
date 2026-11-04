@@ -1,3 +1,7 @@
+// Copyright 2013 The Flutter Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
 #ifndef CAMERA_LINUX_H
 #define CAMERA_LINUX_H
 
@@ -14,9 +18,16 @@ extern "C" {
 #endif
 
 // Status values returned by camera_linux_status().
-#define CAMERA_LINUX_STOPPED 0
 #define CAMERA_LINUX_RUNNING 1
 #define CAMERA_LINUX_FAILED -1
+
+// An open capture device with its streaming thread.
+typedef struct camera_linux_session camera_linux_session;
+
+// Lists capture devices that this library can use, one per line as
+// "<path>\t<card name>\t<fourcc>". The string is malloc()ed (empty when there
+// is none); free it with camera_linux_free().
+CAMERA_LINUX_EXPORT char *camera_linux_list_devices(void);
 
 // Opens a V4L2 capture device and starts a background thread that keeps the
 // most recent frame.
@@ -29,48 +40,46 @@ extern "C" {
 // `jpeg_quality` is 1..100 and is used when frames need to be encoded; pass 0
 // for the default.
 //
-// Returns 0 on success. On failure returns -1 and camera_linux_last_error()
-// describes the problem. A running capture is stopped first.
-CAMERA_LINUX_EXPORT int camera_linux_start(const char *device, int32_t width,
-                                           int32_t height,
-                                           int32_t jpeg_quality);
+// Returns the session, or NULL on failure. On failure, when `error` is not
+// NULL, it receives a malloc()ed description (free with camera_linux_free()).
+CAMERA_LINUX_EXPORT camera_linux_session *camera_linux_open(
+    const char *device, int32_t width, int32_t height, int32_t jpeg_quality,
+    char **error);
 
-// Stops the capture thread and closes the device. Safe to call when nothing
-// is running.
-CAMERA_LINUX_EXPORT void camera_linux_stop(void);
+// Stops the capture thread, closes the device and frees the session. NULL is
+// ignored.
+CAMERA_LINUX_EXPORT void camera_linux_close(camera_linux_session *session);
 
 // CAMERA_LINUX_RUNNING while frames are being captured, CAMERA_LINUX_FAILED
 // when the capture thread stopped because of an error (see
-// camera_linux_last_error()), CAMERA_LINUX_STOPPED otherwise.
-CAMERA_LINUX_EXPORT int camera_linux_status(void);
+// camera_linux_take_error()).
+CAMERA_LINUX_EXPORT int camera_linux_status(camera_linux_session *session);
 
 // Returns the newest frame as a JPEG in a malloc()ed buffer and stores its
 // size in `*length`. Each frame is handed out once: the next call returns
 // NULL with `*length` 0 until the camera delivers another frame. Also returns
-// NULL when nothing is running or a frame could not be converted; in the
-// latter case camera_linux_last_error() returns the reason. Free the buffer
-// with camera_linux_free().
-CAMERA_LINUX_EXPORT uint8_t *camera_linux_read_jpeg(int32_t *length);
-
-// Stores the negotiated frame size. Returns 0, or -1 when nothing is running.
-CAMERA_LINUX_EXPORT int camera_linux_frame_size(int32_t *width,
-                                                int32_t *height);
-
-// Path of the device in use, or NULL when nothing is running. The string is
-// malloc()ed; free it with camera_linux_free().
-CAMERA_LINUX_EXPORT char *camera_linux_device(void);
-
-// Lists capture devices that this library can use, one per line as
-// "<path>\t<card name>\t<fourcc>". The string is malloc()ed (empty when there
-// is none); free it with camera_linux_free().
-CAMERA_LINUX_EXPORT char *camera_linux_list_devices(void);
+// NULL when a frame could not be converted; in that case
+// camera_linux_take_error() returns the reason. Free the buffer with
+// camera_linux_free().
+CAMERA_LINUX_EXPORT uint8_t *camera_linux_read_jpeg(
+    camera_linux_session *session, int32_t *length);
 
 // Takes the pending error message: a malloc()ed copy (free it with
-// camera_linux_free()), or NULL when nothing failed since the previous call
-// or the last camera_linux_start(). Errors come from camera_linux_start(),
-// the capture thread (see camera_linux_status()) and frame conversion in
-// camera_linux_read_jpeg().
-CAMERA_LINUX_EXPORT char *camera_linux_last_error(void);
+// camera_linux_free()), or NULL when nothing failed since the previous call.
+// Errors come from the capture thread (see camera_linux_status()) and frame
+// conversion in camera_linux_read_jpeg().
+CAMERA_LINUX_EXPORT char *camera_linux_take_error(
+    camera_linux_session *session);
+
+// Stores the negotiated frame size.
+CAMERA_LINUX_EXPORT void camera_linux_frame_size(camera_linux_session *session,
+                                                 int32_t *width,
+                                                 int32_t *height);
+
+// Path of the device in use. The string is malloc()ed; free it with
+// camera_linux_free().
+CAMERA_LINUX_EXPORT char *camera_linux_device_path(
+    camera_linux_session *session);
 
 // Frees memory returned by this library.
 CAMERA_LINUX_EXPORT void camera_linux_free(void *ptr);
@@ -78,8 +87,8 @@ CAMERA_LINUX_EXPORT void camera_linux_free(void *ptr);
 // Pure helpers, exported so they can be unit tested.
 
 // Converts one frame to tightly packed RGB. `dst` must hold width*height*3
-// bytes. Returns 0, or -1 if the fourcc is not supported or `src_len` is too
-// short for the frame geometry.
+// bytes. Returns 0, or -1 if the fourcc is not supported, the dimensions are
+// out of range or `src_len` is too short for the frame geometry.
 CAMERA_LINUX_EXPORT int camera_linux_frame_to_rgb(const uint8_t *src,
                                                   int32_t src_len,
                                                   uint32_t fourcc,
@@ -89,7 +98,8 @@ CAMERA_LINUX_EXPORT int camera_linux_frame_to_rgb(const uint8_t *src,
                                                   uint8_t *dst);
 
 // Encodes packed RGB (comp 3) or grey (comp 1) pixels as a baseline JPEG.
-// Returns a malloc()ed buffer and its size, or NULL.
+// `pixels` must hold width*height*comp bytes. Returns a malloc()ed buffer and
+// its size, or NULL.
 CAMERA_LINUX_EXPORT uint8_t *camera_linux_encode_jpeg(const uint8_t *pixels,
                                                       int32_t width,
                                                       int32_t height,

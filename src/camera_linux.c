@@ -1,7 +1,11 @@
+// Copyright 2013 The Flutter Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
 // V4L2 webcam capture for the camera_linux Flutter package.
 //
-// One capture session at a time: a background thread streams frames from the
-// device with memory-mapped buffers and keeps the newest one. Readers get that
+// Each session owns one device and a background thread that streams frames
+// from it with memory-mapped buffers and keeps the newest one. Readers get that
 // frame as a JPEG, either passed through (MJPEG cameras) or encoded here from
 // the raw pixels. Nothing outside libc and the kernel UAPI headers is used.
 
@@ -29,7 +33,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #define STBI_WRITE_NO_STDIO
-#include "stb_image_write.h"
+#include "third_party/stb/stb_image_write.h"
 
 #define DEFAULT_WIDTH 640
 #define DEFAULT_HEIGHT 480
@@ -44,42 +48,33 @@
 // ---------------------------------------------------------------------------
 // Errors
 
-static pthread_mutex_t error_lock = PTHREAD_MUTEX_INITIALIZER;
-static char error_text[512];
-static bool error_set = false;
+// A fixed-size message slot. Each session carries one; camera_linux_open()
+// uses a local one until the session exists.
+typedef struct {
+  char text[512];
+  bool set;
+} error_slot;
 
-static void set_error(const char *fmt, ...) {
-  char text[sizeof(error_text)];
+static void slot_vset(error_slot *slot, const char *fmt, va_list ap) {
+  vsnprintf(slot->text, sizeof(slot->text), fmt, ap);
+  slot->set = true;
+}
+
+static void slot_set(error_slot *slot, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(text, sizeof(text), fmt, ap);
+  slot_vset(slot, fmt, ap);
   va_end(ap);
-  pthread_mutex_lock(&error_lock);
-  memcpy(error_text, text, sizeof(error_text));
-  error_set = true;
-  pthread_mutex_unlock(&error_lock);
 }
 
-static void set_errno_error(const char *what) {
-  set_error("%s: %s", what, strerror(errno));
+static void slot_set_errno(error_slot *slot, const char *what) {
+  slot_set(slot, "%s: %s", what, strerror(errno));
 }
 
-static void clear_error(void) {
-  pthread_mutex_lock(&error_lock);
-  error_set = false;
-  error_text[0] = '\0';
-  pthread_mutex_unlock(&error_lock);
-}
-
-char *camera_linux_last_error(void) {
-  char *copy = NULL;
-  pthread_mutex_lock(&error_lock);
-  if (error_set) {
-    copy = strdup(error_text);
-    error_set = false;
-  }
-  pthread_mutex_unlock(&error_lock);
-  return copy;
+static char *slot_take(error_slot *slot) {
+  if (!slot->set) return NULL;
+  slot->set = false;
+  return strdup(slot->text);
 }
 
 void camera_linux_free(void *ptr) { free(ptr); }
@@ -596,13 +591,15 @@ typedef struct {
   size_t length;
 } mapped_buffer;
 
-static struct {
-  pthread_mutex_t lock;  // guards `frame*` and `thread_failed`
+struct camera_linux_session {
+  pthread_mutex_t lock;  // guards `frame*`, `thread_failed` and `error`
   pthread_t thread;
   bool thread_started;
   atomic_bool stop;
   bool thread_failed;
+  error_slot error;
 
+  // Written before the thread starts and after it has been joined only.
   int fd;
   device_info info;
   uint32_t width, height, bytes_per_line;
@@ -615,159 +612,169 @@ static struct {
   uint8_t *frame;
   size_t frame_len;
   size_t frame_cap;
-} session = {.lock = PTHREAD_MUTEX_INITIALIZER, .fd = -1};
+};
 
-// Serialises start/stop/read against each other.
-static pthread_mutex_t api_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void store_frame(const uint8_t *data, size_t len) {
-  pthread_mutex_lock(&session.lock);
-  if (!session.frame || session.frame_cap < len) {
-    uint8_t *grown = realloc(session.frame, len);
-    if (!grown) {
-      pthread_mutex_unlock(&session.lock);
-      return;
-    }
-    session.frame = grown;
-    session.frame_cap = len;
-  }
-  memcpy(session.frame, data, len);
-  session.frame_len = len;
-  pthread_mutex_unlock(&session.lock);
+static void session_error(camera_linux_session *s, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  pthread_mutex_lock(&s->lock);
+  slot_vset(&s->error, fmt, ap);
+  pthread_mutex_unlock(&s->lock);
+  va_end(ap);
 }
 
-static void mark_thread_failed(void) {
-  pthread_mutex_lock(&session.lock);
-  session.thread_failed = true;
-  pthread_mutex_unlock(&session.lock);
+static void session_errno(camera_linux_session *s, const char *what) {
+  int saved = errno;
+  session_error(s, "%s: %s", what, strerror(saved));
+}
+
+static void store_frame(camera_linux_session *s, const uint8_t *data,
+                        size_t len) {
+  pthread_mutex_lock(&s->lock);
+  if (!s->frame || s->frame_cap < len) {
+    uint8_t *grown = realloc(s->frame, len);
+    if (!grown) {
+      pthread_mutex_unlock(&s->lock);
+      return;
+    }
+    s->frame = grown;
+    s->frame_cap = len;
+  }
+  memcpy(s->frame, data, len);
+  s->frame_len = len;
+  pthread_mutex_unlock(&s->lock);
+}
+
+static void mark_thread_failed(camera_linux_session *s) {
+  pthread_mutex_lock(&s->lock);
+  s->thread_failed = true;
+  pthread_mutex_unlock(&s->lock);
 }
 
 static void *capture_thread(void *arg) {
-  (void)arg;
-  while (!atomic_load(&session.stop)) {
-    struct pollfd pfd = {.fd = session.fd, .events = POLLIN};
+  camera_linux_session *s = arg;
+  while (!atomic_load(&s->stop)) {
+    struct pollfd pfd = {.fd = s->fd, .events = POLLIN};
     int r = poll(&pfd, 1, POLL_TIMEOUT_MS);
     if (r < 0) {
       if (errno == EINTR) continue;
-      set_errno_error("poll");
-      mark_thread_failed();
+      session_errno(s, "poll");
+      mark_thread_failed(s);
       break;
     }
     if (r == 0) continue;
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-      set_error("%s: device error or disconnect", session.info.path);
-      mark_thread_failed();
+      session_error(s, "%s: device error or disconnect", s->info.path);
+      mark_thread_failed(s);
       break;
     }
     struct v4l2_buffer buf;
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
-    if (xioctl(session.fd, VIDIOC_DQBUF, &buf) < 0) {
+    if (xioctl(s->fd, VIDIOC_DQBUF, &buf) < 0) {
       if (errno == EAGAIN) continue;
-      set_errno_error("VIDIOC_DQBUF");
-      mark_thread_failed();
+      session_errno(s, "VIDIOC_DQBUF");
+      mark_thread_failed(s);
       break;
     }
-    if (buf.index < session.buffer_count && !(buf.flags & V4L2_BUF_FLAG_ERROR) &&
+    if (buf.index < s->buffer_count && !(buf.flags & V4L2_BUF_FLAG_ERROR) &&
         buf.bytesused > 0) {
       size_t used = buf.bytesused;
-      if (used > session.buffers[buf.index].length) {
-        used = session.buffers[buf.index].length;
+      if (used > s->buffers[buf.index].length) {
+        used = s->buffers[buf.index].length;
       }
-      store_frame(session.buffers[buf.index].start, used);
+      store_frame(s, s->buffers[buf.index].start, used);
     }
-    if (xioctl(session.fd, VIDIOC_QBUF, &buf) < 0) {
-      set_errno_error("VIDIOC_QBUF");
-      mark_thread_failed();
+    if (xioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
+      session_errno(s, "VIDIOC_QBUF");
+      mark_thread_failed(s);
       break;
     }
   }
   return NULL;
 }
 
-static void teardown_session(void) {
-  if (session.thread_started) {
-    atomic_store(&session.stop, true);
-    pthread_join(session.thread, NULL);
-    session.thread_started = false;
+// Stops the thread and releases the device; the struct itself stays.
+static void teardown_session(camera_linux_session *s) {
+  if (s->thread_started) {
+    atomic_store(&s->stop, true);
+    pthread_join(s->thread, NULL);
+    s->thread_started = false;
   }
-  if (session.fd >= 0) {
-    if (session.streaming) {
+  if (s->fd >= 0) {
+    if (s->streaming) {
       enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      xioctl(session.fd, VIDIOC_STREAMOFF, &type);
-      session.streaming = false;
+      xioctl(s->fd, VIDIOC_STREAMOFF, &type);
+      s->streaming = false;
     }
-    for (unsigned i = 0; i < session.buffer_count; i++) {
-      if (session.buffers[i].start && session.buffers[i].start != MAP_FAILED) {
-        munmap(session.buffers[i].start, session.buffers[i].length);
+    for (unsigned i = 0; i < s->buffer_count; i++) {
+      if (s->buffers[i].start && s->buffers[i].start != MAP_FAILED) {
+        munmap(s->buffers[i].start, s->buffers[i].length);
       }
-      session.buffers[i].start = NULL;
-      session.buffers[i].length = 0;
+      s->buffers[i].start = NULL;
+      s->buffers[i].length = 0;
     }
-    session.buffer_count = 0;
-    close(session.fd);
-    session.fd = -1;
+    s->buffer_count = 0;
+    close(s->fd);
+    s->fd = -1;
   }
-  pthread_mutex_lock(&session.lock);
-  free(session.frame);
-  session.frame = NULL;
-  session.frame_len = 0;
-  session.frame_cap = 0;
-  session.thread_failed = false;
-  pthread_mutex_unlock(&session.lock);
-  memset(&session.info, 0, sizeof(session.info));
+  free(s->frame);
+  s->frame = NULL;
+  s->frame_len = 0;
+  s->frame_cap = 0;
 }
 
-static int open_requested_device(const char *device) {
+static int open_requested_device(camera_linux_session *s, const char *device,
+                                 error_slot *err) {
   const char *why = "unknown";
   if (device && *device) {
-    int fd = probe_device(device, &session.info, &why);
-    if (fd < 0) set_error("%s: %s", device, why);
+    int fd = probe_device(device, &s->info, &why);
+    if (fd < 0) slot_set(err, "%s: %s", device, why);
     return fd;
   }
   const char *env = getenv("CAMERA_LINUX_DEVICE");
   if (env && *env) {
-    int fd = probe_device(env, &session.info, &why);
-    if (fd < 0) set_error("%s (CAMERA_LINUX_DEVICE): %s", env, why);
+    int fd = probe_device(env, &s->info, &why);
+    if (fd < 0) slot_set(err, "%s (CAMERA_LINUX_DEVICE): %s", env, why);
     return fd;
   }
   first_device_ctx ctx = {.fd = -1};
   for_each_video_node(take_first_device, &ctx);
   if (ctx.fd < 0) {
-    set_error("no usable video capture device found under /dev");
+    slot_set(err, "no usable video capture device found under /dev");
     return -1;
   }
-  session.info = ctx.info;
+  s->info = ctx.info;
   return ctx.fd;
 }
 
-static int setup_streaming(int32_t width, int32_t height) {
+static int setup_streaming(camera_linux_session *s, int32_t width,
+                           int32_t height, error_slot *err) {
   struct v4l2_format fmt;
   memset(&fmt, 0, sizeof(fmt));
   fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   fmt.fmt.pix.width = (uint32_t)width;
   fmt.fmt.pix.height = (uint32_t)height;
-  fmt.fmt.pix.pixelformat = session.info.fourcc;
+  fmt.fmt.pix.pixelformat = s->info.fourcc;
   fmt.fmt.pix.field = V4L2_FIELD_ANY;
-  if (xioctl(session.fd, VIDIOC_S_FMT, &fmt) < 0) {
-    set_errno_error("VIDIOC_S_FMT");
+  if (xioctl(s->fd, VIDIOC_S_FMT, &fmt) < 0) {
+    slot_set_errno(err, "VIDIOC_S_FMT");
     return -1;
   }
   if (format_rank(fmt.fmt.pix.pixelformat) < 0) {
     char fourcc[5];
     fourcc_string(fmt.fmt.pix.pixelformat, fourcc);
-    set_error("driver switched to unsupported pixel format %s", fourcc);
+    slot_set(err, "driver switched to unsupported pixel format %s", fourcc);
     return -1;
   }
-  session.info.fourcc = fmt.fmt.pix.pixelformat;
-  session.width = fmt.fmt.pix.width;
-  session.height = fmt.fmt.pix.height;
-  session.bytes_per_line = fmt.fmt.pix.bytesperline;
-  if (session.width == 0 || session.height == 0 ||
-      session.width > MAX_DIMENSION || session.height > MAX_DIMENSION) {
-    set_error("driver reported frame size %ux%u", session.width,
-              session.height);
+  s->info.fourcc = fmt.fmt.pix.pixelformat;
+  s->width = fmt.fmt.pix.width;
+  s->height = fmt.fmt.pix.height;
+  s->bytes_per_line = fmt.fmt.pix.bytesperline;
+  if (s->width == 0 || s->height == 0 || s->width > MAX_DIMENSION ||
+      s->height > MAX_DIMENSION) {
+    slot_set(err, "driver reported frame size %ux%u", s->width, s->height);
     return -1;
   }
 
@@ -776,12 +783,12 @@ static int setup_streaming(int32_t width, int32_t height) {
   req.count = BUFFER_COUNT;
   req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   req.memory = V4L2_MEMORY_MMAP;
-  if (xioctl(session.fd, VIDIOC_REQBUFS, &req) < 0) {
-    set_errno_error("VIDIOC_REQBUFS");
+  if (xioctl(s->fd, VIDIOC_REQBUFS, &req) < 0) {
+    slot_set_errno(err, "VIDIOC_REQBUFS");
     return -1;
   }
   if (req.count < 2) {
-    set_error("driver granted only %u buffers", req.count);
+    slot_set(err, "driver granted only %u buffers", req.count);
     return -1;
   }
   if (req.count > BUFFER_COUNT) req.count = BUFFER_COUNT;
@@ -791,160 +798,149 @@ static int setup_streaming(int32_t width, int32_t height) {
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = i;
-    if (xioctl(session.fd, VIDIOC_QUERYBUF, &buf) < 0) {
-      set_errno_error("VIDIOC_QUERYBUF");
+    if (xioctl(s->fd, VIDIOC_QUERYBUF, &buf) < 0) {
+      slot_set_errno(err, "VIDIOC_QUERYBUF");
       return -1;
     }
     void *start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-                       session.fd, buf.m.offset);
+                       s->fd, buf.m.offset);
     if (start == MAP_FAILED) {
-      set_errno_error("mmap");
+      slot_set_errno(err, "mmap");
       return -1;
     }
-    session.buffers[i].start = start;
-    session.buffers[i].length = buf.length;
-    session.buffer_count = i + 1;
+    s->buffers[i].start = start;
+    s->buffers[i].length = buf.length;
+    s->buffer_count = i + 1;
   }
-  for (unsigned i = 0; i < session.buffer_count; i++) {
+  for (unsigned i = 0; i < s->buffer_count; i++) {
     struct v4l2_buffer buf;
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     buf.index = i;
-    if (xioctl(session.fd, VIDIOC_QBUF, &buf) < 0) {
-      set_errno_error("VIDIOC_QBUF");
+    if (xioctl(s->fd, VIDIOC_QBUF, &buf) < 0) {
+      slot_set_errno(err, "VIDIOC_QBUF");
       return -1;
     }
   }
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  if (xioctl(session.fd, VIDIOC_STREAMON, &type) < 0) {
-    set_errno_error("VIDIOC_STREAMON");
+  if (xioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
+    slot_set_errno(err, "VIDIOC_STREAMON");
     return -1;
   }
-  session.streaming = true;
+  s->streaming = true;
   return 0;
 }
 
-int camera_linux_start(const char *device, int32_t width, int32_t height,
-                       int32_t jpeg_quality) {
-  pthread_mutex_lock(&api_lock);
-  teardown_session();
-  clear_error();
+static void destroy_session(camera_linux_session *s) {
+  teardown_session(s);
+  pthread_mutex_destroy(&s->lock);
+  free(s);
+}
+
+camera_linux_session *camera_linux_open(const char *device, int32_t width,
+                                        int32_t height, int32_t jpeg_quality,
+                                        char **error) {
+  if (error) *error = NULL;
+  error_slot err = {.set = false};
+  camera_linux_session *s = calloc(1, sizeof(*s));
+  if (!s) {
+    if (error) *error = strdup("out of memory");
+    return NULL;
+  }
+  pthread_mutex_init(&s->lock, NULL);
+  s->fd = -1;
+  atomic_init(&s->stop, false);
   if (width <= 0 || height <= 0) {
     width = DEFAULT_WIDTH;
     height = DEFAULT_HEIGHT;
   }
-  session.jpeg_quality = (jpeg_quality > 0 && jpeg_quality <= 100)
-                             ? jpeg_quality
-                             : DEFAULT_JPEG_QUALITY;
-  session.fd = open_requested_device(device);
-  if (session.fd < 0) {
-    pthread_mutex_unlock(&api_lock);
-    return -1;
+  s->jpeg_quality = (jpeg_quality > 0 && jpeg_quality <= 100)
+                        ? jpeg_quality
+                        : DEFAULT_JPEG_QUALITY;
+  s->fd = open_requested_device(s, device, &err);
+  if (s->fd >= 0 && setup_streaming(s, width, height, &err) == 0) {
+    int rc = pthread_create(&s->thread, NULL, capture_thread, s);
+    if (rc == 0) {
+      s->thread_started = true;
+      return s;
+    }
+    slot_set(&err, "pthread_create: %s", strerror(rc));
   }
-  if (setup_streaming(width, height) < 0) {
-    teardown_session();
-    pthread_mutex_unlock(&api_lock);
-    return -1;
-  }
-  atomic_store(&session.stop, false);
-  int err = pthread_create(&session.thread, NULL, capture_thread, NULL);
-  if (err != 0) {
-    set_error("pthread_create: %s", strerror(err));
-    teardown_session();
-    pthread_mutex_unlock(&api_lock);
-    return -1;
-  }
-  session.thread_started = true;
-  pthread_mutex_unlock(&api_lock);
-  return 0;
+  destroy_session(s);
+  if (error) *error = slot_take(&err);
+  return NULL;
 }
 
-void camera_linux_stop(void) {
-  pthread_mutex_lock(&api_lock);
-  teardown_session();
-  pthread_mutex_unlock(&api_lock);
+void camera_linux_close(camera_linux_session *s) {
+  if (s) destroy_session(s);
 }
 
-int camera_linux_status(void) {
-  pthread_mutex_lock(&api_lock);
-  int status = CAMERA_LINUX_STOPPED;
-  if (session.thread_started) {
-    pthread_mutex_lock(&session.lock);
-    status = session.thread_failed ? CAMERA_LINUX_FAILED : CAMERA_LINUX_RUNNING;
-    pthread_mutex_unlock(&session.lock);
-  }
-  pthread_mutex_unlock(&api_lock);
+int camera_linux_status(camera_linux_session *s) {
+  pthread_mutex_lock(&s->lock);
+  int status = s->thread_failed ? CAMERA_LINUX_FAILED : CAMERA_LINUX_RUNNING;
+  pthread_mutex_unlock(&s->lock);
   return status;
 }
 
-int camera_linux_frame_size(int32_t *width, int32_t *height) {
-  pthread_mutex_lock(&api_lock);
-  int r = -1;
-  if (session.fd >= 0) {
-    if (width) *width = (int32_t)session.width;
-    if (height) *height = (int32_t)session.height;
-    r = 0;
-  }
-  pthread_mutex_unlock(&api_lock);
-  return r;
-}
-
-char *camera_linux_device(void) {
-  pthread_mutex_lock(&api_lock);
-  char *copy = session.fd >= 0 ? strdup(session.info.path) : NULL;
-  pthread_mutex_unlock(&api_lock);
+char *camera_linux_take_error(camera_linux_session *s) {
+  pthread_mutex_lock(&s->lock);
+  char *copy = slot_take(&s->error);
+  pthread_mutex_unlock(&s->lock);
   return copy;
 }
 
-uint8_t *camera_linux_read_jpeg(int32_t *length) {
+void camera_linux_frame_size(camera_linux_session *s, int32_t *width,
+                             int32_t *height) {
+  if (width) *width = (int32_t)s->width;
+  if (height) *height = (int32_t)s->height;
+}
+
+char *camera_linux_device_path(camera_linux_session *s) {
+  return strdup(s->info.path);
+}
+
+uint8_t *camera_linux_read_jpeg(camera_linux_session *s, int32_t *length) {
   if (length) *length = 0;
   if (!length) return NULL;
-  pthread_mutex_lock(&api_lock);
-  if (!session.thread_started) {
-    pthread_mutex_unlock(&api_lock);
-    return NULL;
-  }
   // Take the frame out of the session so the capture thread can allocate a
   // fresh one while this one is being converted.
-  pthread_mutex_lock(&session.lock);
-  uint8_t *raw = session.frame;
-  size_t raw_len = session.frame_len;
-  session.frame = NULL;
-  session.frame_len = 0;
-  session.frame_cap = 0;
-  pthread_mutex_unlock(&session.lock);
-  uint32_t fourcc = session.info.fourcc;
-  int32_t w = (int32_t)session.width, h = (int32_t)session.height;
-  int32_t stride = (int32_t)session.bytes_per_line;
-  int quality = session.jpeg_quality;
-  pthread_mutex_unlock(&api_lock);
-
+  pthread_mutex_lock(&s->lock);
+  uint8_t *raw = s->frame;
+  size_t raw_len = s->frame_len;
+  s->frame = NULL;
+  s->frame_len = 0;
+  s->frame_cap = 0;
+  pthread_mutex_unlock(&s->lock);
   if (!raw || raw_len == 0 || raw_len > INT32_MAX) {
     free(raw);
     return NULL;
   }
+
+  uint32_t fourcc = s->info.fourcc;
+  int32_t w = (int32_t)s->width, h = (int32_t)s->height;
+  int32_t stride = (int32_t)s->bytes_per_line;
   uint8_t *jpeg = NULL;
   if (is_jpeg_format(fourcc)) {
     jpeg = camera_linux_fix_mjpeg(raw, (int32_t)raw_len, length);
-    if (!jpeg) set_error("camera delivered a frame that is not a JPEG");
+    if (!jpeg) session_error(s, "camera delivered a frame that is not a JPEG");
   } else if (fourcc == V4L2_PIX_FMT_GREY && stride == w &&
              raw_len >= (size_t)w * (size_t)h) {
-    jpeg = camera_linux_encode_jpeg(raw, w, h, 1, quality, length);
-    if (!jpeg) set_error("JPEG encoding failed");
+    jpeg = camera_linux_encode_jpeg(raw, w, h, 1, s->jpeg_quality, length);
+    if (!jpeg) session_error(s, "JPEG encoding failed");
   } else {
     uint8_t *rgb = malloc((size_t)w * (size_t)h * 3);
     if (!rgb) {
-      set_error("out of memory converting frame");
+      session_error(s, "out of memory converting frame");
     } else if (camera_linux_frame_to_rgb(raw, (int32_t)raw_len, fourcc, w, h,
                                          stride, rgb) < 0) {
       char fcc[5];
       fourcc_string(fourcc, fcc);
-      set_error("cannot convert %s frame of %zu bytes (%dx%d, stride %d)", fcc,
-                raw_len, w, h, stride);
+      session_error(s, "cannot convert %s frame of %zu bytes (%dx%d, stride %d)",
+                    fcc, raw_len, w, h, stride);
     } else {
-      jpeg = camera_linux_encode_jpeg(rgb, w, h, 3, quality, length);
-      if (!jpeg) set_error("JPEG encoding failed");
+      jpeg = camera_linux_encode_jpeg(rgb, w, h, 3, s->jpeg_quality, length);
+      if (!jpeg) session_error(s, "JPEG encoding failed");
     }
     free(rgb);
   }
